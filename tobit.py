@@ -5,32 +5,78 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 import scipy.stats
+from scipy.stats import norm
 from scipy.special import log_ndtr
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
-def split_left_right_censored(x, y, cens):
-    counts = cens.value_counts()
-    if -1 not in counts and 1 not in counts:
-        warnings.warn("No censored observations; use regression methods for uncensored data")
-    xs = []
-    ys = []
 
-    for value in [-1, 0, 1]:
-        if value in counts:
-            split = cens == value
-            y_split = np.squeeze(y[split].values)
-            x_split = x[split].values
+def tobit_loss(x, y, coef, sigma, sample_weight=None, yl=0, yu=np.inf):
 
-        else:
-            y_split, x_split = None, None
-        xs.append(x_split)
-        ys.append(y_split)
-    return xs, ys
+    const = 0.5 * np.log(2 * math.pi) + np.log(sigma)
+    pred = np.dot(x, coef)
+    pred = pred.ravel()
+    diff = (y - pred) / sigma
+    indl = (y == yl)
+    indu = (y == yu)
+    indmid = (y > yl) & (y < yu)
+    if sample_weight is None:
+        loss = (np.sum((diff[indmid] ** 2.0)/2 + const)
+                - np.sum(norm.logcdf(diff[indl]))
+                - np.sum(norm.logcdf(-diff[indu])))
+    else:
+        loss = (((np.sum(sample_weight[indmid]
+                    * ((diff[indmid] ** 2.0) / 2 + const))
+                    - np.sum(sample_weight[indl] * norm.logcdf(diff[indl]))
+                    - np.sum(sample_weight[indu] * norm.logcdf(-diff[indu])))) 
+                / sample_weight.sum())
+    return loss
 
+def tobit_loss_negative_gradient(x, y, coef, sigma, sample_weight=None, yl=0, yu=np.inf):
 
-def tobit_neg_log_likelihood(xs, ys, params):
+    pred = np.dot(x, coef)
+    pred = pred.ravel()
+    diff = (y - pred)/sigma
+    indl = (y == yl)
+    indu = (y == yu)
+    indmid = (y > yl) & (y < yu)
+    residual = np.zeros((y.shape[0],), dtype=np.float64)
+    residual[indl] = (- np.exp(norm.logpdf(diff[indl])
+                        - norm.logcdf(diff[indl])) / sigma)
+    residual[indmid] = diff[indmid] / sigma
+    residual[indu] = (np.exp(norm.logpdf(diff[indu])
+                        - norm.logcdf(-diff[indu])) / sigma)
+
+    if sample_weight is not None:
+        residual = residual * sample_weight
+    raise "missing grad wrt to sigma"
+    return np.sum(residual)
+
+def tobit_loss_hessian(self, y, pred, residual, **kargs):
+    """Compute the second derivative """
+    sigma = self.sigma
+    sigma2 = self.sigma ** 2
+    yl = self.yl
+    yu = self.yu
+    diff = (y - pred.ravel())/sigma
+    indl = (y == yl)
+    indu = (y == yu)
+    indmid = (y > yl) & (y < yu)
+    hessian = np.zeros((y.shape[0],), dtype=np.float64)
+    lognpdfl = norm.logpdf(diff[indl])
+    logncdfl = norm.logcdf(diff[indl])
+    lognpdfu = norm.logpdf(diff[indu])
+    logncdfu = norm.logcdf(-diff[indu])
+    hessian[indmid] = 1/sigma2
+    hessian[indl] = (np.exp(lognpdfl - logncdfl) / sigma2 * diff[indl]
+                        + np.exp(2*lognpdfl-2 * logncdfl) / sigma2)
+    hessian[indu] = (- np.exp(lognpdfu-logncdfu)/sigma2 * diff[indu]
+                        + np.exp(2*lognpdfu-2 * logncdfu) / sigma2)
+    raise "need to add sample weights"
+    return hessian
+
+def old_tobit_loss(xs, ys, params):
     x_left, x_mid, x_right = xs
     y_left, y_mid, y_right = ys
 
@@ -68,7 +114,7 @@ def tobit_neg_log_likelihood(xs, ys, params):
     return - loglik
 
 
-def tobit_neg_log_likelihood_der(xs, ys, params):
+def old_tobit_loss_der(xs, ys, params):
     x_left, x_mid, x_right = xs
     y_left, y_mid, y_right = ys
 
@@ -114,6 +160,16 @@ def tobit_neg_log_likelihood_der(xs, ys, params):
     return -combo_jac
 
 
+def k_fun(t, t0, H, type="epa"):
+    if type == "epa":
+        k = 1 - ((t-t0)**2)/(H**2) 
+    if type == "exp":
+        k = np.exp((t-t0)/H) 
+    if type == "gauss":
+        k = np.exp(-(t-t0)**2/H**2) 
+
+    k[k<0] = 0
+    return k
 class TobitModel:
     def __init__(self, fit_intercept=True):
         self.fit_intercept = fit_intercept
@@ -123,31 +179,35 @@ class TobitModel:
         self.intercept_ = None
         self.sigma_ = None
 
-    def fit(self, x, y, cens, verbose=False):
+    def fit(self, x, y, type=None, bandwidth = 20, verbose=False):
         """
         Fit a maximum-likelihood Tobit regression
         :param x: Pandas DataFrame (n_samples, n_features): Data
         :param y: Pandas Series (n_samples,): Target
-        :param cens: Pandas Series (n_samples,): -1 indicates left-censored samples, 0 for uncensored, 1 for right-censored
         :param verbose: boolean, show info from minimization
         :return:
         """
+
+        if type is None:
+            sample_weight=None
+        else:
+            T_train = y.shape[0]
+            sample_weight = k_fun(np.array(range(T_train)), bandwidth, 20, type=type)
         x_copy = x.copy()
         if self.fit_intercept:
             x_copy.insert(0, 'intercept', 1.0)
-        else:
-            x_copy.scale(with_mean=True, with_std=False, copy=False)
+ 
         init_reg = LinearRegression(fit_intercept=False).fit(x_copy, y)
         b0 = init_reg.coef_
+        self.b0 = b0
         y_pred = init_reg.predict(x_copy)
         resid = y - y_pred
         resid_var = np.var(resid)
         s0 = np.sqrt(resid_var)
         params0 = np.append(b0, s0)
-        xs, ys = split_left_right_censored(x_copy, y, cens)
-
-        result = minimize(lambda params: tobit_neg_log_likelihood(xs, ys, params), params0, method='BFGS',
-                          jac=lambda params: tobit_neg_log_likelihood_der(xs, ys, params), options={'disp': verbose})
+        self.params0 = params0
+        # print(tobit_loss(x_copy, y, params0[:-1], params0[-1]))
+        result = minimize(lambda params: tobit_loss(x_copy, y, params[:-1], params[-1], sample_weight=sample_weight), params0, method='BFGS', options={'disp': verbose})
         if verbose:
             print(result)
         self.ols_coef_ = b0[1:]

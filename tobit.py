@@ -161,14 +161,16 @@ def old_tobit_loss_der(xs, ys, params):
 
 
 def k_fun(t, t0, H, type="epa"):
+    
     if type == "epa":
-        k = 1 - ((t-t0)**2)/(H**2) 
-    if type == "exp":
+        k = 1 - ((t-t0)**2)/(H**2)
+    elif type == "exp":
         k = np.exp((t-t0)/H) 
-    if type == "gauss":
-        k = np.exp(-(t-t0)**2/H**2) 
+    elif type == "gauss":
+        k = np.exp(-(t-t0)**2/H**2)
 
-    k[k<0] = 0
+    k[k < 0] = 0
+
     return k
 class TobitModel:
     def __init__(self, fit_intercept=True):
